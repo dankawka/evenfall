@@ -7,6 +7,7 @@ stays the single source of truth and its own sliders keep working.
     evenfall status          current vs scheduled brightness
     evenfall apply           force one application now
     evenfall preview         day curve as a sparkline
+    evenfall identify DP-2   flash monitors so you can tell them apart
     evenfall pause 90m       stop touching screens for a while
     evenfall daemon          long-running loop (used by systemd)
     evenfall install         install + enable systemd user service
@@ -385,6 +386,38 @@ def cmd_status(_args) -> int:
     return 0
 
 
+def cmd_identify(args) -> int:
+    """Flash a monitor (or every monitor in turn) so you can tell them apart."""
+    outputs = read_outputs()
+    names = [name.upper() for name in args.monitor] or list(outputs)
+    flashed = 0
+    for name in names:
+        if name not in outputs:
+            warn(f"unknown monitor {name}")
+            continue
+        if outputs[name] is None:
+            warn(f"{name} does not report brightness control")
+            continue
+        restore = outputs[name] or 50
+        try:
+            for _ in range(3):
+                apply_targets({name: 100})
+                time.sleep(0.22)
+                apply_targets({name: 10})
+                time.sleep(0.22)
+        except RuntimeError as exc:
+            warn(f"{name}: {exc}")
+            return 1
+        apply_targets({name: restore})
+        print(f"{name} flashed")
+        flashed += 1
+        time.sleep(0.25)
+    if not flashed:
+        warn("nothing to identify")
+        return 1
+    return 0
+
+
 def cmd_apply(args) -> int:
     cfg = load_config()
     targets = tick(cfg, force=not args.if_changed, dry=args.dry_run)
@@ -585,6 +618,10 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.set_defaults(func=cmd_apply)
 
     sub.add_parser("preview", help="day curve as a sparkline").set_defaults(func=cmd_preview)
+
+    p_identify = sub.add_parser("identify", help="flash monitors so you can tell them apart")
+    p_identify.add_argument("monitor", nargs="*", help="connector names (default: all)")
+    p_identify.set_defaults(func=cmd_identify)
 
     p_pause = sub.add_parser("pause", help="temporarily leave screens alone")
     p_pause.add_argument("duration", nargs="?", default="60m", help="30m, 2h, 90 (default 60m)")

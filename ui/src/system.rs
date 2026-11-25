@@ -59,6 +59,10 @@ pub fn run_cli(args: &[&str]) -> Result<String, String> {
     }
 }
 
+pub fn identify(name: &str) -> Result<(), String> {
+    run_cli(&["identify", name]).map(|_| ())
+}
+
 pub fn apply_brightness() -> Result<(), String> {
     run_cli(&["apply"]).map(|_| ())
 }

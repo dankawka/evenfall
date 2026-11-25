@@ -27,6 +27,8 @@ pub enum Message {
     UninstallDaemon,
     StartDaemon,
     StopDaemon,
+    Identify(String),
+    Identified(Result<(), String>),
 }
 
 pub struct App {
@@ -341,6 +343,29 @@ pub fn update(app: &mut App, message: Message) -> iced::Task<Message> {
                 Ok(()) => {
                     app.ok = true;
                     app.status = "daemon removed, curve kept in config".to_string();
+                }
+                Err(err) => {
+                    app.ok = false;
+                    app.status = err;
+                }
+            }
+            app.refresh_hardware();
+        }
+
+        Message::Identify(name) => {
+            app.ok = true;
+            app.status = format!("identifying {name}");
+            return iced::Task::perform(
+                async move { system::identify(&name) },
+                Message::Identified,
+            );
+        }
+
+        Message::Identified(result) => {
+            match result {
+                Ok(()) => {
+                    app.ok = true;
+                    app.status = "identified".to_string();
                 }
                 Err(err) => {
                     app.ok = false;

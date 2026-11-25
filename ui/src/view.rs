@@ -121,27 +121,35 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         let dot = if monitor.enabled { ACCENT } else { MUTED };
 
         list = list.push(
-            button(
-                column![
-                    row![
-                        container(Space::new().width(6).height(6))
-                            .style(chip(dot, dot)),
-                        text(&monitor.name).size(14).font(bold()).color(TEXT),
-                        space::horizontal(),
-                        text(if monitor.enabled { "" } else { "off" })
-                            .size(10)
-                            .color(MUTED),
+            row![
+                button(
+                    column![
+                        row![
+                            container(Space::new().width(6).height(6))
+                                .style(chip(dot, dot)),
+                            text(&monitor.name).size(14).font(bold()).color(TEXT),
+                            space::horizontal(),
+                            text(if monitor.enabled { "" } else { "off" })
+                                .size(10)
+                                .color(MUTED),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                        text(status).size(11).color(status_color),
                     ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                    text(status).size(11).color(status_color),
-                ]
-                .spacing(3),
-            )
-            .style(style::monitor_row(selected))
-            .on_press(Message::SelectMonitor(index))
-            .padding([8, 10])
-            .width(Fill),
+                    .spacing(3),
+                )
+                .style(style::monitor_row(selected))
+                .on_press(Message::SelectMonitor(index))
+                .padding([8, 10])
+                .width(Fill),
+                button(text("identify").size(10).color(MUTED))
+                    .style(style::quiet)
+                    .on_press(Message::Identify(monitor.name.clone()))
+                    .padding([4, 6]),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center),
         );
     }
 
@@ -187,7 +195,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         .spacing(8),
     )
     .style(style::panel)
-    .width(Length::Fixed(232.0))
+    .width(Length::Fixed(252.0))
     .height(Fill)
     .padding(10)
     .into()

@@ -64,6 +64,8 @@ evenfall status               # current vs scheduled brightness, next change
 evenfall preview              # the day curve as a sparkline
 evenfall apply                # apply now (overrides manual changes)
 evenfall apply --dry-run      # show what would be written
+evenfall identify DP-2        # flash a monitor so you know which one it is
+evenfall identify             # flash every monitor in turn
 evenfall pause 2h             # leave the screens alone (film, presentation, photos)
 evenfall resume
 systemctl --user restart evenfall        # restart the daemon
@@ -78,6 +80,10 @@ journalctl --user -u evenfall -f         # watch brightness changes
 lets you drag keyframes: 15-minute steps across, 1% up and down. Every edit is
 saved and applied on the spot. Points refuse to land on top of each other, so
 dragging past a neighbour never deletes it.
+
+Each monitor row has an “identify” action: it flashes that screen three times
+between 100% and 10% and puts the brightness back, so a connector name maps to a
+physical panel without guessing. The same lives in `evenfall identify`.
 
 The sidebar owns the schedule daemon: install it, start or stop it, and remove
 it again without leaving the app. “Pause 1h” mutes the schedule without
