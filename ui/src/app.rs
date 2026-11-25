@@ -29,6 +29,7 @@ pub enum Message {
     StopDaemon,
     Identify(String),
     Identified(Result<(), String>),
+    SetMode(String),
 }
 
 pub struct App {
@@ -39,6 +40,8 @@ pub struct App {
     pub paused: Option<String>,
     pub daemon: bool,
     pub installed: bool,
+    pub mode: String,
+    pub lux: Option<(f32, i64)>,
     pub status: String,
     pub ok: bool,
     pub selected_point: Option<u64>,
@@ -56,6 +59,7 @@ impl App {
         for output in &outputs {
             cfg.add_monitor(&output.name);
         }
+        let mode = cfg.mode.clone();
         let mut app = Self {
             cfg,
             selected: 0,
@@ -64,6 +68,8 @@ impl App {
             paused: system::pause_until(),
             daemon: system::daemon_active(),
             installed: system::unit_installed(),
+            mode,
+            lux: system::ambient_sample(),
             status: "ready".to_string(),
             ok: true,
             selected_point: None,
@@ -134,6 +140,7 @@ impl App {
         self.paused = system::pause_until();
         self.daemon = system::daemon_active();
         self.installed = system::unit_installed();
+        self.lux = system::ambient_sample();
         if self.selected >= self.cfg.monitors.len() {
             self.selected = self.cfg.monitors.len().saturating_sub(1);
         }
@@ -366,6 +373,24 @@ pub fn update(app: &mut App, message: Message) -> iced::Task<Message> {
                 Ok(()) => {
                     app.ok = true;
                     app.status = "identified".to_string();
+                }
+                Err(err) => {
+                    app.ok = false;
+                    app.status = err;
+                }
+            }
+            app.refresh_hardware();
+        }
+
+        Message::SetMode(mode) => {
+            match system::set_mode(&mode) {
+                Ok(()) => {
+                    if let Ok(cfg) = Config::load() {
+                        app.cfg = cfg;
+                        app.mode = app.cfg.mode.clone();
+                    }
+                    app.ok = true;
+                    app.status = format!("mode: {mode}");
                 }
                 Err(err) => {
                     app.ok = false;

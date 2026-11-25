@@ -133,6 +133,30 @@ pub fn ghost(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+pub fn segment(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let (background, border, text) = if selected {
+            (ACCENT_SOFT, ACCENT, TEXT)
+        } else {
+            match status {
+                button::Status::Hovered => (SURFACE2, BORDER, TEXT),
+                button::Status::Pressed => (ACCENT_SOFT, ACCENT, TEXT),
+                _ => (Color::TRANSPARENT, BORDER, MUTED),
+            }
+        };
+        button::Style {
+            background: Some(background.into()),
+            text_color: text,
+            border: Border {
+                color: border,
+                width: 1.0,
+                radius: radius(7.0),
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
 pub fn quiet(_theme: &Theme, status: button::Status) -> button::Style {
     let color = match status {
         button::Status::Hovered => TEXT,

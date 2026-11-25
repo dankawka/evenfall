@@ -59,6 +59,33 @@ pub fn run_cli(args: &[&str]) -> Result<String, String> {
     }
 }
 
+pub fn set_mode(mode: &str) -> Result<(), String> {
+    run_cli(&["mode", mode]).map(|_| ())
+}
+
+pub fn ambient_sample() -> Option<(f32, i64)> {
+    let path = dirs::state_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state"))
+        .join("evenfall")
+        .join("ambient.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let lux: f32 = json_field(&text, "lux")?.parse().ok()?;
+    let at = json_field(&text, "at")?;
+    let at = at.trim_matches('"');
+    let when = chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S").ok()?;
+    let age = (chrono::Local::now().naive_local() - when).num_seconds().max(0);
+    Some((lux, age))
+}
+
+fn json_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = text.find(&needle)? + needle.len();
+    let rest = &text[start..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    Some(rest[..end].trim().to_string())
+}
+
 pub fn identify(name: &str) -> Result<(), String> {
     run_cli(&["identify", name]).map(|_| ())
 }

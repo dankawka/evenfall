@@ -12,11 +12,18 @@ pub struct Point {
     pub value: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LuxPoint {
+    pub lux: u32,
+    pub value: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct Monitor {
     pub name: String,
     pub enabled: bool,
     pub points: Vec<Point>,
+    pub ambient: Vec<LuxPoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +32,8 @@ pub struct Config {
     pub reassert_minutes: u64,
     pub defaults: Vec<Point>,
     pub monitors: Vec<Monitor>,
+    pub mode: String,
+    pub ambient: Vec<LuxPoint>,
     next_id: u64,
 }
 
@@ -35,6 +44,8 @@ impl Default for Config {
             reassert_minutes: 0,
             defaults: Vec::new(),
             monitors: Vec::new(),
+            mode: "schedule".to_string(),
+            ambient: Vec::new(),
             next_id: 1,
         }
     }
@@ -67,17 +78,20 @@ impl Config {
             name: name.to_string(),
             enabled: true,
             points: Vec::new(),
+            ambient: Vec::new(),
         });
     }
 
     pub fn load() -> Result<Self, String> {
         let file = path();
-        let text = match fs::read_to_string(&file) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(err) => return Err(format!("{}: {err}", file.display())),
-        };
+        match fs::read_to_string(&file) {
+            Ok(text) => Ok(Self::parse(&text)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(format!("{}: {err}", file.display())),
+        }
+    }
 
+    pub fn parse(text: &str) -> Self {
         let mut config = Self::default();
         let mut section: Section = Section::Root;
 
@@ -91,10 +105,18 @@ impl Config {
                 let name = name.trim();
                 if name == "defaults" {
                     section = Section::Defaults;
+                } else if name == "ambient" {
+                    section = Section::Ambient(None);
                 } else if let Some(monitor) = name.strip_prefix("monitors.") {
                     let monitor = monitor.trim().trim_matches('"').to_string();
                     config.add_monitor(&monitor);
-                    section = Section::Monitor(config.monitors.len() - 1);
+                    let index = config.monitor_index(&monitor).unwrap_or(0);
+                    section = Section::Monitor(index);
+                } else if let Some(monitor) = name.strip_prefix("ambient.") {
+                    let monitor = monitor.trim().trim_matches('"').to_string();
+                    config.add_monitor(&monitor);
+                    let index = config.monitor_index(&monitor).unwrap_or(0);
+                    section = Section::Ambient(Some(index));
                 } else {
                     section = Section::Other;
                 }
@@ -113,6 +135,12 @@ impl Config {
                     "reassert_minutes" => {
                         config.reassert_minutes = value.parse().unwrap_or(0)
                     }
+                    "mode" => {
+                        let mode = value.trim().trim_matches('"').to_lowercase();
+                        if mode == "ambient" || mode == "schedule" {
+                            config.mode = mode;
+                        }
+                    }
                     _ => {}
                 },
                 Section::Defaults => {
@@ -121,17 +149,20 @@ impl Config {
                     }
                 }
                 Section::Monitor(index) => {
-                    let monitor_name = config.monitors[index].name.clone();
-                    let points = match key {
-                        "enabled" => {
-                            config.monitors[index].enabled = value != "false";
-                            continue;
-                        }
-                        _ => parse_point(&mut config, key, value),
-                    };
-                    let _ = &monitor_name;
-                    if let Some(point) = points {
+                    if key == "enabled" {
+                        config.monitors[index].enabled = value != "false";
+                        continue;
+                    }
+                    if let Some(point) = parse_point(&mut config, key, value) {
                         config.monitors[index].points.push(point);
+                    }
+                }
+                Section::Ambient(index) => {
+                    if let Some(point) = parse_lux(key, value) {
+                        match index {
+                            Some(index) => config.monitors[index].ambient.push(point),
+                            None => config.ambient.push(point),
+                        }
                     }
                 }
                 Section::Other => {}
@@ -139,10 +170,12 @@ impl Config {
         }
 
         config.defaults.sort_by_key(|p| p.minute);
+        config.ambient.sort_by_key(|p| p.lux);
         for monitor in &mut config.monitors {
             monitor.points.sort_by_key(|p| p.minute);
+            monitor.ambient.sort_by_key(|p| p.lux);
         }
-        Ok(config)
+        config
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -161,6 +194,14 @@ impl Config {
         out.push_str("# Written by evenfall-ui; the daemon reloads it on every tick.\n\n");
         out.push_str(&format!("tick = {}\n", self.tick));
         out.push_str(&format!("reassert_minutes = {}\n", self.reassert_minutes));
+        out.push_str(&format!("mode = \"{}\"\n", self.mode));
+
+        if !self.ambient.is_empty() {
+            out.push_str("\n# Ambient mode: brightness from illuminance instead of the clock.\n[ambient]\n");
+            for point in &self.ambient {
+                out.push_str(&format!("\"{}\" = {}\n", point.lux, point.value));
+            }
+        }
 
         out.push_str("\n# Shared curve for monitors without their own section.\n[defaults]\n");
         for point in &self.defaults {
@@ -181,6 +222,12 @@ impl Config {
             for point in &monitor.points {
                 out.push_str(&point_line(point));
             }
+            if !monitor.ambient.is_empty() {
+                out.push_str(&format!("\n[ambient.\"{}\"]\n", monitor.name));
+                for point in &monitor.ambient {
+                    out.push_str(&format!("\"{}\" = {}\n", point.lux, point.value));
+                }
+            }
         }
         out
     }
@@ -190,7 +237,20 @@ enum Section {
     Root,
     Defaults,
     Monitor(usize),
+    Ambient(Option<usize>),
     Other,
+}
+
+fn parse_lux(key: &str, value: &str) -> Option<LuxPoint> {
+    let lux: f32 = key.trim().trim_matches('"').parse().ok()?;
+    if lux < 0.0 {
+        return None;
+    }
+    let value: i32 = value.trim().parse().ok()?;
+    Some(LuxPoint {
+        lux: lux as u32,
+        value: value.clamp(0, 100) as u8,
+    })
 }
 
 fn point_line(point: &Point) -> String {
@@ -225,6 +285,44 @@ fn strip_comment(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ambient_sections_do_not_leak_into_monitors() {
+        let text = r#"
+mode = "ambient"
+
+[ambient]
+"5" = 10
+"300" = 55
+
+[ambient."DP-2"]
+"5" = 5
+"500" = 40
+
+[monitors."DP-3"]
+"10:00" = 80
+
+[monitors."DP-2"]
+"10:00" = 50
+"16:00" = 10
+"#;
+        let cfg = Config::parse(text);
+        assert_eq!(cfg.mode, "ambient");
+        assert_eq!(cfg.ambient.len(), 2);
+
+        let dp3 = cfg.monitors.iter().find(|m| m.name == "DP-3").unwrap();
+        assert_eq!(dp3.points.len(), 1);
+        assert!(dp3.ambient.is_empty());
+
+        let dp2 = cfg.monitors.iter().find(|m| m.name == "DP-2").unwrap();
+        assert_eq!(dp2.points.len(), 2);
+        assert_eq!(dp2.ambient.len(), 2);
+
+        // Rendering must stay valid TOML: no repeated key inside one table.
+        let rendered = cfg.render();
+        assert_eq!(rendered.matches("\"10:00\" = 80").count(), 1);
+        assert_eq!(rendered.matches("[ambient.").count(), 1);
+    }
 
     #[test]
     fn render_roundtrip() {

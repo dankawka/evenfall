@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -24,7 +25,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -50,6 +51,7 @@ CONFIG_PATH = Path(os.environ["EVENFALL_CONFIG"]) if os.environ.get("EVENFALL_CO
 STATE_DIR = Path(os.environ["EVENFALL_STATE"]) if os.environ.get("EVENFALL_STATE") \
     else _xdg("XDG_STATE_HOME", ".local/state") / APP
 STATE_PATH = STATE_DIR / "state.json"
+AMBIENT_PATH = STATE_DIR / "ambient.json"
 BIN_PATH = Path.home() / ".local/bin" / APP
 UNIT_DIR = _xdg("XDG_CONFIG_HOME", ".config") / "systemd/user"
 UNIT_PATH = UNIT_DIR / f"evenfall.service"
@@ -62,6 +64,7 @@ class Monitor:
     name: str
     keyframes: list[tuple[int, int]]  # (minute of day, 0-100), sorted
     enabled: bool = True
+    ambient: list[tuple[int, int]] = field(default_factory=list)  # (lux, 0-100)
 
     def at(self, minute: int) -> int | None:
         kf = self.keyframes
@@ -98,6 +101,12 @@ class Config:
     reassert_minutes: int
     monitors: dict[str, Monitor]
     defaults: list[tuple[int, int]]
+    mode: str = "schedule"                       # schedule | ambient
+    ambient: list[tuple[int, int]] = field(default_factory=list)
+    ambient_timeout: int = 300                   # seconds before ambient goes stale
+    ambient_deadband: int = 2                    # percent of change worth a DDC write
+    http_bind: str = "127.0.0.1:8787"
+    http_token: str = ""
 
 
 def _clamp(value: float) -> int:
@@ -142,20 +151,80 @@ def load_config() -> Config:
     except tomllib.TOMLDecodeError as exc:
         sys.exit(f"{CONFIG_PATH}: {exc}")
     defaults = _parse_keyframes(data.get("defaults") or {}, "[defaults]")
+    ambient_tables = data.get("ambient") or {}
+    ambient = _parse_lux(ambient_tables, "[ambient]")
     monitors: dict[str, Monitor] = {}
     for name, section in (data.get("monitors") or {}).items():
         if not isinstance(section, dict):
             continue
         kf = _parse_keyframes(section, f"[monitors.{name}]")
+        extra = ambient_tables.get(name) or ambient_tables.get(name.upper())
         monitors[name.upper()] = Monitor(
             name=name.upper(),
             keyframes=kf or defaults,
             enabled=bool(section.get("enabled", True)),
+            ambient=_parse_lux(extra or {}, f"[ambient.{name}]"),
         )
     tick = _int_setting(data, "tick", 60, minimum=10)
     reassert = _int_setting(data, "reassert_minutes", 0, minimum=0)
-    return Config(tick=tick, reassert_minutes=reassert,
-                  monitors=monitors, defaults=defaults)
+    mode = str(data.get("mode", "schedule")).strip().strip('"').lower()
+    if mode not in ("schedule", "ambient"):
+        warn(f"unknown mode {mode!r}, using schedule")
+        mode = "schedule"
+    return Config(
+        tick=tick,
+        reassert_minutes=reassert,
+        monitors=monitors,
+        defaults=defaults,
+        mode=mode,
+        ambient=ambient,
+        ambient_timeout=_int_setting(data, "ambient_timeout", 300, minimum=10),
+        ambient_deadband=_int_setting(data, "ambient_deadband", 2, minimum=0),
+        http_bind=str(data.get("http_bind", "127.0.0.1:8787")),
+        http_token=str(data.get("http_token", "")),
+    )
+
+
+def _parse_lux(section: dict, where: str) -> list[tuple[int, int]]:
+    """Parse ``lux -> brightness`` pairs; nested tables are monitor overrides."""
+    points: dict[int, int] = {}
+    for key, value in section.items():
+        if isinstance(value, dict):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            warn(f"{where}: brightness for {key!r} must be a number, skipping")
+            continue
+        try:
+            lux = int(float(str(key).strip('"')))
+        except ValueError:
+            warn(f"{where}: ignoring unknown key {key!r}")
+            continue
+        if lux < 0:
+            warn(f"{where}: lux must be >= 0, skipping {key!r}")
+            continue
+        points[lux] = _clamp(float(value))
+    return sorted(points.items())
+
+
+def ambient_value(points: list[tuple[int, int]], lux: float) -> int | None:
+    """Interpolate brightness in log(lux), which matches how light is perceived."""
+    if not points:
+        return None
+    if len(points) == 1:
+        return points[0][1]
+    if lux <= points[0][0]:
+        return points[0][1]
+    if lux >= points[-1][0]:
+        return points[-1][1]
+    for (l0, v0), (l1, v1) in zip(points, points[1:]):
+        if l0 <= lux <= l1:
+            a = math.log10(max(l0, 1))
+            b = math.log10(max(l1, 1))
+            if b <= a:
+                return v0
+            t = (math.log10(max(lux, 1)) - a) / (b - a)
+            return _clamp(v0 + (v1 - v0) * t)
+    return points[-1][1]
 
 
 def _int_setting(data: dict, key: str, default: int, minimum: int) -> int:
@@ -257,6 +326,29 @@ def pause_until() -> datetime | None:
     return when if when > datetime.now() else None
 
 
+def save_ambient(lux: float) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"lux": max(0.0, float(lux)),
+               "at": datetime.now().isoformat(timespec="seconds")}
+    tmp = AMBIENT_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(AMBIENT_PATH)
+
+
+def read_ambient(timeout: int) -> tuple[float, float] | None:
+    """Return (lux, age in seconds) when a fresh sample exists."""
+    try:
+        data = json.loads(AMBIENT_PATH.read_text())
+        lux = float(data["lux"])
+        at = datetime.fromisoformat(data["at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    age = (datetime.now() - at).total_seconds()
+    if age < 0 or age > timeout:
+        return None
+    return lux, age
+
+
 def warn(message: str) -> None:
     print(f"evenfall: {message}", file=sys.stderr)
 
@@ -282,9 +374,32 @@ def current_targets(cfg: Config, outputs: dict[str, int | None], now: datetime) 
     return targets
 
 
+def ambient_targets(cfg: Config, outputs: dict[str, int | None], lux: float) -> dict[str, int]:
+    targets: dict[str, int] = {}
+    for name in outputs:
+        if outputs.get(name) is None:
+            continue
+        monitor = cfg.monitors.get(name)
+        if monitor is not None and not monitor.enabled:
+            continue
+        points = (monitor.ambient if monitor else []) or cfg.ambient
+        value = ambient_value(points, lux)
+        if value is not None:
+            targets[name] = value
+    return targets
+
+
 def tick(cfg: Config, force: bool, dry: bool = False) -> dict[str, int]:
     outputs = read_outputs()
-    targets = current_targets(cfg, outputs, datetime.now())
+    now = datetime.now()
+    sample = read_ambient(cfg.ambient_timeout) if cfg.mode == "ambient" else None
+    if sample is not None:
+        targets = ambient_targets(cfg, outputs, sample[0])
+        # Monitors without an ambient profile keep following the clock.
+        for name, value in current_targets(cfg, outputs, now).items():
+            targets.setdefault(name, value)
+    else:
+        targets = current_targets(cfg, outputs, now)
     state = load_state()
     previous = state.get("targets") or {}
     if dry:
@@ -302,6 +417,13 @@ def tick(cfg: Config, force: bool, dry: bool = False) -> dict[str, int]:
         changed = {n: v for n, v in targets.items() if outputs.get(n) != v}
     else:
         changed = {n: v for n, v in targets.items() if previous.get(n) != v}
+    if cfg.mode == "ambient" and sample is not None and not force:
+        # Small lux wobble must not hammer DDC/CI.
+        changed = {
+            name: value
+            for name, value in changed.items()
+            if abs(value - previous.get(name, -100)) >= cfg.ambient_deadband
+        }
     if state.get("outputs") and sorted(outputs) != state.get("outputs"):
         changed = targets  # a display was added or removed: re-assert everything
     if changed:
@@ -321,6 +443,88 @@ def tick(cfg: Config, force: bool, dry: bool = False) -> dict[str, int]:
     return targets
 
 
+def start_http(cfg: Config) -> None:
+    """Accept lux samples from Home Assistant (POST /lux) in a background thread."""
+    import http.server
+    import threading
+
+    host, _, raw_port = cfg.http_bind.rpartition(":")
+    try:
+        port = int(raw_port)
+    except ValueError:
+        warn(f"http_bind {cfg.http_bind!r} is not host:port, ambient HTTP disabled")
+        return
+    if host not in ("127.0.0.1", "localhost", "::1") and not cfg.http_token:
+        warn(f"http_bind {cfg.http_bind} is reachable from the network but http_token is empty")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = f"{APP}/{VERSION}"
+
+        def _reply(self, code: int, payload: dict) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorized(self) -> bool:
+            if not cfg.http_token:
+                return True
+            token = self.headers.get("X-Evenfall-Token") or ""
+            if not token:
+                query = self.path.partition("?")[2]
+                for part in query.split("&"):
+                    key, _, value = part.partition("=")
+                    if key == "token":
+                        token = value
+            return token == cfg.http_token
+
+        def do_POST(self) -> None:  # noqa: N802 - http.server API
+            if self.path.split("?")[0].rstrip("/") != "/lux":
+                self._reply(404, {"error": "not found"})
+                return
+            if not self._authorized():
+                self._reply(401, {"error": "bad token"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length).decode().strip()
+                try:
+                    lux = float(json.loads(raw)["lux"])
+                except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    lux = float(raw)
+                if lux < 0 or lux > 200_000:
+                    raise ValueError("lux out of range")
+            except ValueError as exc:
+                self._reply(400, {"error": str(exc)})
+                return
+            save_ambient(lux)
+            self._reply(200, {"ok": True, "lux": lux, "mode": cfg.mode})
+
+        def do_GET(self) -> None:  # noqa: N802 - http.server API
+            if self.path.split("?")[0].rstrip("/") not in ("/status", "/"):
+                self._reply(404, {"error": "not found"})
+                return
+            sample = read_ambient(cfg.ambient_timeout)
+            self._reply(200, {
+                "mode": cfg.mode,
+                "lux": round(sample[0], 1) if sample else None,
+                "age": round(sample[1], 1) if sample else None,
+            })
+
+        def log_message(self, *args) -> None:
+            return
+
+    try:
+        server = http.server.ThreadingHTTPServer((host or "127.0.0.1", port), Handler)
+    except OSError as exc:
+        warn(f"ambient HTTP disabled: {exc}")
+        return
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"ambient HTTP listening on {cfg.http_bind}", flush=True)
+
+
 def daemon() -> int:
     force_flag = {"value": True}
 
@@ -330,6 +534,7 @@ def daemon() -> int:
     signal.signal(signal.SIGUSR1, _force)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(f"evenfall {VERSION} started, config {CONFIG_PATH}", flush=True)
+    start_http(load_config())
     last_tick: float | None = None
     while True:
         cfg = load_config()
@@ -379,8 +584,16 @@ def cmd_status(_args) -> int:
             if upcoming:
                 nxt = f"{upcoming[0]} → {upcoming[1]}%"
         print(f"{name:<10} {shown:>4} {sched:>7}  {nxt}")
+    sample = read_ambient(cfg.ambient_timeout) if cfg.mode == "ambient" else None
+    if cfg.mode == "ambient":
+        if sample:
+            print(f"\nmode: ambient · {sample[0]:.0f} lx ({sample[1]:.0f}s ago)")
+        else:
+            print("\nmode: ambient · no fresh lux, following the clock")
+    else:
+        print(f"\nmode: {cfg.mode}")
     if paused:
-        print(f"\npaused until {paused:%Y-%m-%d %H:%M}")
+        print(f"paused until {paused:%Y-%m-%d %H:%M}")
     if not cfg.monitors:
         print(f"\nno [monitors.*] sections in {CONFIG_PATH}")
     return 0
@@ -463,6 +676,45 @@ def _parse_duration(text: str) -> timedelta:
     return timedelta(hours=amount) if unit == "h" else timedelta(minutes=amount)
 
 
+def cmd_lux(args) -> int:
+    try:
+        lux = float(args.value)
+    except ValueError:
+        sys.exit("lux must be a number")
+    if not 0 <= lux <= 200_000:
+        sys.exit("lux must be between 0 and 200000")
+    save_ambient(lux)
+    print(f"lux {lux:g} recorded (mode {load_config().mode})")
+    return 0
+
+
+def set_mode(value: str) -> None:
+    line = f'mode = "{value}"'
+    text = CONFIG_PATH.read_text() if CONFIG_PATH.exists() else ""
+    if re.search(r"(?m)^\s*mode\s*=", text):
+        text = re.sub(r"(?m)^\s*mode\s*=.*$", lambda _: line, text, count=1)
+    else:
+        match = re.search(r"(?m)^\s*tick\s*=.*$", text)
+        if match:
+            text = text[: match.end()] + "\n" + line + text[match.end():]
+        else:
+            text = line + "\n\n" + text
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(text)
+
+
+def cmd_mode(args) -> int:
+    if args.value is None:
+        print(load_config().mode)
+        return 0
+    value = args.value.strip().lower()
+    if value not in ("schedule", "ambient"):
+        sys.exit("mode must be schedule or ambient")
+    set_mode(value)
+    print(f"mode set to {value}")
+    return 0
+
+
 def cmd_pause(args) -> int:
     try:
         delta = _parse_duration(args.duration)
@@ -520,6 +772,18 @@ DEFAULT_CONFIG = """\
 
 tick = 60              # seconds between recalculations (min 10)
 reassert_minutes = 0   # >0: force the value every N minutes
+mode = "schedule"      # schedule | ambient
+ambient_timeout = 300  # seconds without a lux sample before falling back to the clock
+ambient_deadband = 2   # percent of change worth a DDC/CI write
+http_bind = "127.0.0.1:8787"   # where Home Assistant posts lux samples
+http_token = ""                # optional shared secret, sent as X-Evenfall-Token
+
+# Ambient mode: brightness from illuminance instead of the clock.
+[ambient]
+"5" = 10
+"50" = 25
+"300" = 55
+"1000" = 85
 
 # Shared curve for monitors without their own section.
 [defaults]
@@ -576,7 +840,8 @@ def cmd_install(args) -> int:
         return 0
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-    subprocess.run(["systemctl", "--user", "enable", "--now", f"evenfall.service"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", f"evenfall.service"], check=False)
+    subprocess.run(["systemctl", "--user", "restart", f"evenfall.service"], check=False)
     status = subprocess.run(["systemctl", "--user", "is-active", f"evenfall.service"],
                             capture_output=True, text=True)
     print(f"service: {status.stdout.strip() or 'unknown'}")
@@ -618,6 +883,14 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.set_defaults(func=cmd_apply)
 
     sub.add_parser("preview", help="day curve as a sparkline").set_defaults(func=cmd_preview)
+
+    p_lux = sub.add_parser("lux", help="record an ambient light reading")
+    p_lux.add_argument("value", help="illuminance in lux")
+    p_lux.set_defaults(func=cmd_lux)
+
+    p_mode = sub.add_parser("mode", help="show or switch schedule/ambient mode")
+    p_mode.add_argument("value", nargs="?", help="schedule or ambient")
+    p_mode.set_defaults(func=cmd_mode)
 
     p_identify = sub.add_parser("identify", help="flash monitors so you can tell them apart")
     p_identify.add_argument("monitor", nargs="*", help="connector names (default: all)")

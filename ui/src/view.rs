@@ -9,7 +9,10 @@ use crate::app::{App, Message};
 use crate::chart::Chart;
 use crate::config::Point;
 use crate::curve;
-use crate::style::{self, bold, chip, ACCENT, BAD, BAD_BG, BORDER, MUTED, OK, OK_BG, TEXT, WARN, WARN_BG};
+use crate::style::{
+    self, bold, chip, ACCENT, ACCENT_SOFT, BAD, BAD_BG, BORDER, MUTED, OK, OK_BG, TEXT, WARN,
+    WARN_BG,
+};
 
 pub fn theme(_app: &App) -> Theme {
     style::theme()
@@ -43,7 +46,32 @@ fn header(app: &App) -> Element<'_, Message> {
             .style(chip(BAD_BG, BAD))
     });
 
+    let mut chips = chips;
+    if app.mode == "ambient" {
+        let label = match app.lux {
+            Some((lux, age)) => format!("{lux:.0} lx, {age}s ago"),
+            None => "no lux sample".to_string(),
+        };
+        chips = chips.push(
+            container(text(label).size(11).color(ACCENT))
+                .padding([4, 8])
+                .style(chip(ACCENT_SOFT, ACCENT)),
+        );
+    }
+
     let actions = chips
+        .push(
+            button(text("Schedule").size(11))
+                .style(style::segment(app.mode == "schedule"))
+                .on_press(Message::SetMode("schedule".to_string()))
+                .padding([4, 8]),
+        )
+        .push(
+            button(text("Ambient").size(11))
+                .style(style::segment(app.mode == "ambient"))
+                .on_press(Message::SetMode("ambient".to_string()))
+                .padding([4, 8]),
+        )
         .push(
             button("Apply now")
                 .style(button::primary)
@@ -53,8 +81,7 @@ fn header(app: &App) -> Element<'_, Message> {
             button(if app.paused.is_some() { "Resume" } else { "Pause 1h" })
                 .style(style::ghost)
                 .on_press(Message::TogglePause),
-        )
-        .push(button("Refresh").style(style::quiet).on_press(Message::Refresh));
+        );
 
     container(
         row![
