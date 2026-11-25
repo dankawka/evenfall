@@ -1,0 +1,244 @@
+//! Reading and writing the evenfall TOML config without pulling a TOML crate.
+
+use std::fs;
+use std::path::PathBuf;
+
+use crate::curve;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Point {
+    pub id: u64,
+    pub minute: u16,
+    pub value: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct Monitor {
+    pub name: String,
+    pub enabled: bool,
+    pub points: Vec<Point>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub tick: u64,
+    pub reassert_minutes: u64,
+    pub defaults: Vec<Point>,
+    pub monitors: Vec<Monitor>,
+    next_id: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            tick: 60,
+            reassert_minutes: 0,
+            defaults: Vec::new(),
+            monitors: Vec::new(),
+            next_id: 1,
+        }
+    }
+}
+
+pub fn path() -> PathBuf {
+    if let Some(raw) = std::env::var_os("EVENFALL_CONFIG") {
+        return PathBuf::from(raw);
+    }
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("evenfall").join("config.toml")
+}
+
+impl Config {
+    pub fn new_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    pub fn monitor_index(&self, name: &str) -> Option<usize> {
+        self.monitors.iter().position(|m| m.name == name)
+    }
+
+    pub fn add_monitor(&mut self, name: &str) {
+        if self.monitor_index(name).is_some() {
+            return;
+        }
+        self.monitors.push(Monitor {
+            name: name.to_string(),
+            enabled: true,
+            points: Vec::new(),
+        });
+    }
+
+    pub fn load() -> Result<Self, String> {
+        let file = path();
+        let text = match fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(format!("{}: {err}", file.display())),
+        };
+
+        let mut config = Self::default();
+        let mut section: Section = Section::Root;
+
+        for raw in text.lines() {
+            let line = strip_comment(raw).trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                let name = name.trim();
+                if name == "defaults" {
+                    section = Section::Defaults;
+                } else if let Some(monitor) = name.strip_prefix("monitors.") {
+                    let monitor = monitor.trim().trim_matches('"').to_string();
+                    config.add_monitor(&monitor);
+                    section = Section::Monitor(config.monitors.len() - 1);
+                } else {
+                    section = Section::Other;
+                }
+                continue;
+            }
+
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().trim_matches('"');
+            let value = value.trim();
+
+            match section {
+                Section::Root => match key {
+                    "tick" => config.tick = value.parse().unwrap_or(60).max(10),
+                    "reassert_minutes" => {
+                        config.reassert_minutes = value.parse().unwrap_or(0)
+                    }
+                    _ => {}
+                },
+                Section::Defaults => {
+                    if let Some(point) = parse_point(&mut config, key, value) {
+                        config.defaults.push(point);
+                    }
+                }
+                Section::Monitor(index) => {
+                    let monitor_name = config.monitors[index].name.clone();
+                    let points = match key {
+                        "enabled" => {
+                            config.monitors[index].enabled = value != "false";
+                            continue;
+                        }
+                        _ => parse_point(&mut config, key, value),
+                    };
+                    let _ = &monitor_name;
+                    if let Some(point) = points {
+                        config.monitors[index].points.push(point);
+                    }
+                }
+                Section::Other => {}
+            }
+        }
+
+        config.defaults.sort_by_key(|p| p.minute);
+        for monitor in &mut config.monitors {
+            monitor.points.sort_by_key(|p| p.minute);
+        }
+        Ok(config)
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let file = path();
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        fs::write(&file, self.render()).map_err(|e| format!("{}: {e}", file.display()))
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# evenfall — display brightness by time of day.\n");
+        out.push_str("# Values are 0-100 (%), interpolated linearly between keyframes.\n");
+        out.push_str("# Keyframes on both sides of midnight close the loop automatically.\n");
+        out.push_str("# Written by evenfall-ui; the daemon reloads it on every tick.\n\n");
+        out.push_str(&format!("tick = {}\n", self.tick));
+        out.push_str(&format!("reassert_minutes = {}\n", self.reassert_minutes));
+
+        out.push_str("\n# Shared curve for monitors without their own section.\n[defaults]\n");
+        for point in &self.defaults {
+            out.push_str(&point_line(point));
+        }
+
+        for monitor in &self.monitors {
+            out.push_str(&format!(
+                "\n[monitors.\"{}\"]\n",
+                monitor.name
+            ));
+            if !monitor.enabled {
+                out.push_str("enabled = false\n");
+            }
+            if monitor.points.is_empty() {
+                out.push_str("# no keyframes: the [defaults] curve applies\n");
+            }
+            for point in &monitor.points {
+                out.push_str(&point_line(point));
+            }
+        }
+        out
+    }
+}
+
+enum Section {
+    Root,
+    Defaults,
+    Monitor(usize),
+    Other,
+}
+
+fn point_line(point: &Point) -> String {
+    format!("\"{}\" = {}\n", curve::fmt(point.minute), point.value)
+}
+
+fn parse_point(config: &mut Config, key: &str, value: &str) -> Option<Point> {
+    let minute = match key.split_once(':') {
+        Some(_) => curve::parse_time(key)?,
+        None => return None,
+    };
+    let value: i32 = value.trim().trim_matches('"').parse().ok()?;
+    Some(Point {
+        id: config.new_id(),
+        minute,
+        value: value.clamp(0, 100) as u8,
+    })
+}
+
+fn strip_comment(line: &str) -> &str {
+    let mut in_quote = false;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            '#' if !in_quote => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.defaults.push(Point { id: 1, minute: 360, value: 50 });
+        cfg.add_monitor("DP-3");
+        let id = cfg.new_id();
+        cfg.monitors[0].points.push(Point { id, minute: 600, value: 80 });
+        cfg.monitors[0].enabled = false;
+
+        let rendered = cfg.render();
+        // The daemon parses this with tomllib, so the shape must stay valid.
+        assert!(rendered.contains("[monitors.\"DP-3\"]"));
+        assert!(rendered.contains("enabled = false"));
+        assert!(rendered.contains("\"10:00\" = 80"));
+    }
+}

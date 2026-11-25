@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""evenfall — time-of-day brightness curves for KDE Plasma.
+
+Drives external (DDC/CI) and internal displays through kscreen-doctor, so KDE
+stays the single source of truth and its own sliders keep working.
+
+    evenfall status          current vs scheduled brightness
+    evenfall apply           force one application now
+    evenfall preview         day curve as a sparkline
+    evenfall pause 90m       stop touching screens for a while
+    evenfall daemon          long-running loop (used by systemd)
+    evenfall install         install + enable systemd user service
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    sys.exit("evenfall needs Python 3.11+ (tomllib)")
+
+APP = "evenfall"
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+TIME_KEY = re.compile(r"^(\d{1,2}):(\d{2})$")
+VERSION = "0.1.0"
+
+
+# --------------------------------------------------------------------------- paths
+
+def _xdg(var: str, fallback: str) -> Path:
+    return Path(os.environ.get(var) or (Path.home() / fallback))
+
+
+CONFIG_PATH = Path(os.environ["EVENFALL_CONFIG"]) if os.environ.get("EVENFALL_CONFIG") \
+    else _xdg("XDG_CONFIG_HOME", ".config") / APP / "config.toml"
+STATE_DIR = Path(os.environ["EVENFALL_STATE"]) if os.environ.get("EVENFALL_STATE") \
+    else _xdg("XDG_STATE_HOME", ".local/state") / APP
+STATE_PATH = STATE_DIR / "state.json"
+BIN_PATH = Path.home() / ".local/bin" / APP
+UNIT_DIR = _xdg("XDG_CONFIG_HOME", ".config") / "systemd/user"
+UNIT_PATH = UNIT_DIR / f"evenfall.service"
+
+
+# --------------------------------------------------------------------------- model
+
+@dataclass
+class Monitor:
+    name: str
+    keyframes: list[tuple[int, int]]  # (minute of day, 0-100), sorted
+    enabled: bool = True
+
+    def at(self, minute: int) -> int | None:
+        kf = self.keyframes
+        if not kf:
+            return None
+        if len(kf) == 1:
+            return kf[0][1]
+        last = kf[-1]
+        head = kf[0]
+        for (m0, v0), (m1, v1) in zip(kf, kf[1:]):
+            if m0 <= minute <= m1:
+                return _lerp(m0, v0, m1, v1, minute)
+        # Outside the first/last keyframe: interpolate across midnight.
+        span = (1440 - last[0]) + head[0]
+        if span <= 0:
+            return last[1]
+        pos = (minute - last[0]) % 1440
+        value = last[1] + (head[1] - last[1]) * pos / span
+        return _clamp(value)
+
+    def next_change(self, minute: int) -> tuple[str, int] | None:
+        if not self.keyframes:
+            return None
+        for m, v in self.keyframes:
+            if m > minute:
+                return _hm(m), v
+        m, v = self.keyframes[0]
+        return _hm(m), v
+
+
+@dataclass
+class Config:
+    tick: int
+    reassert_minutes: int
+    monitors: dict[str, Monitor]
+    defaults: list[tuple[int, int]]
+
+
+def _clamp(value: float) -> int:
+    return max(0, min(100, int(round(value))))
+
+
+def _lerp(m0: int, v0: int, m1: int, v1: int, m: int) -> int:
+    if m1 == m0:
+        return v0
+    return _clamp(v0 + (v1 - v0) * (m - m0) / (m1 - m0))
+
+
+def _hm(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def _parse_keyframes(section: dict, where: str) -> list[tuple[int, int]]:
+    kf: dict[int, int] = {}
+    for key, value in section.items():
+        if key in ("enabled",):
+            continue
+        match = TIME_KEY.match(str(key))
+        if not match:
+            warn(f"{where}: ignoring unknown key {key!r}")
+            continue
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if hour > 24 or minute > 59 or (hour == 24 and minute):
+            warn(f"{where}: invalid time {key!r}, skipping")
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            warn(f"{where}: brightness for {key!r} must be a number, skipping")
+            continue
+        kf[(hour * 60 + minute) % 1440] = _clamp(float(value))
+    return sorted(kf.items())
+
+
+def load_config() -> Config:
+    if not CONFIG_PATH.exists():
+        return Config(tick=60, reassert_minutes=0, monitors={}, defaults=[])
+    try:
+        data = tomllib.loads(CONFIG_PATH.read_text())
+    except tomllib.TOMLDecodeError as exc:
+        sys.exit(f"{CONFIG_PATH}: {exc}")
+    defaults = _parse_keyframes(data.get("defaults") or {}, "[defaults]")
+    monitors: dict[str, Monitor] = {}
+    for name, section in (data.get("monitors") or {}).items():
+        if not isinstance(section, dict):
+            continue
+        kf = _parse_keyframes(section, f"[monitors.{name}]")
+        monitors[name.upper()] = Monitor(
+            name=name.upper(),
+            keyframes=kf or defaults,
+            enabled=bool(section.get("enabled", True)),
+        )
+    tick = _int_setting(data, "tick", 60, minimum=10)
+    reassert = _int_setting(data, "reassert_minutes", 0, minimum=0)
+    return Config(tick=tick, reassert_minutes=reassert,
+                  monitors=monitors, defaults=defaults)
+
+
+def _int_setting(data: dict, key: str, default: int, minimum: int) -> int:
+    raw = data.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        warn(f"{key} must be a whole number, using {default}")
+        return default
+    if value < minimum:
+        warn(f"{key} must be >= {minimum}, using {minimum}")
+        return minimum
+    return value
+
+
+# --------------------------------------------------------------------------- kscreen
+
+def _wayland_env() -> dict[str, str]:
+    env = os.environ.copy()
+    runtime = env.get("XDG_RUNTIME_DIR")
+    display = env.get("WAYLAND_DISPLAY")
+    if runtime:
+        if not display:
+            sockets = sorted(Path(runtime).glob("wayland-*"))
+            sockets = [s for s in sockets if not s.name.endswith(".lock")]
+            if sockets:
+                env["WAYLAND_DISPLAY"] = sockets[0].name
+        elif not (Path(runtime) / display).exists():
+            sockets = sorted(Path(runtime).glob("wayland-*"))
+            sockets = [s for s in sockets if not s.name.endswith(".lock")]
+            if sockets:
+                env["WAYLAND_DISPLAY"] = sockets[0].name
+    return env
+
+
+def _kscreen(*args: str) -> str:
+    exe = shutil.which("kscreen-doctor")
+    if not exe:
+        sys.exit("kscreen-doctor not found — is this a KDE Plasma 6 session?")
+    proc = subprocess.run([exe, *args], capture_output=True, text=True,
+                          env=_wayland_env(), timeout=20)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        raise RuntimeError(detail[0] if detail else f"kscreen-doctor failed ({proc.returncode})")
+    return proc.stdout
+
+
+def read_outputs() -> dict[str, int | None]:
+    """connector name -> current brightness (percent) or None if unsupported."""
+    text = ANSI.sub("", _kscreen("-o"))
+    outputs: dict[str, int | None] = {}
+    name: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        header = re.match(r"Output:\s*\d+\s+(\S+)", stripped)
+        if header:
+            candidate = header.group(1).upper()
+            name = candidate if re.fullmatch(r"[A-Za-z]+(-[A-Za-z0-9]+)*-\d+", candidate) else None
+            if name:
+                outputs[name] = None
+        elif name and stripped.startswith("Brightness control:"):
+            match = re.search(r"set to (\d+)%", stripped)
+            if match:
+                outputs[name] = int(match.group(1))
+    return outputs
+
+
+def apply_targets(targets: dict[str, int]) -> None:
+    if not targets:
+        return
+    args = [f"output.{name}.brightness.{value}" for name, value in targets.items()]
+    _kscreen(*args)
+
+
+# --------------------------------------------------------------------------- state
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_PATH)
+
+
+def pause_until() -> datetime | None:
+    raw = load_state().get("pause_until")
+    if not raw:
+        return None
+    try:
+        when = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return when if when > datetime.now() else None
+
+
+def warn(message: str) -> None:
+    print(f"evenfall: {message}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- core
+
+def current_targets(cfg: Config, outputs: dict[str, int | None], now: datetime) -> dict[str, int]:
+    minute = now.hour * 60 + now.minute
+    targets: dict[str, int] = {}
+    for name in outputs:
+        if outputs.get(name) is None:  # no brightness control reported
+            continue
+        monitor = cfg.monitors.get(name)
+        if monitor is None:
+            if not cfg.defaults:
+                continue
+            monitor = Monitor(name=name, keyframes=cfg.defaults)
+        if not monitor.enabled:
+            continue
+        value = monitor.at(minute)
+        if value is not None:
+            targets[name] = value
+    return targets
+
+
+def tick(cfg: Config, force: bool, dry: bool = False) -> dict[str, int]:
+    outputs = read_outputs()
+    targets = current_targets(cfg, outputs, datetime.now())
+    state = load_state()
+    previous = state.get("targets") or {}
+    if dry:
+        return targets
+    if not force and cfg.reassert_minutes:
+        stamp = state.get("applied_at")
+        if stamp:
+            try:
+                age = (datetime.now() - datetime.fromisoformat(stamp)).total_seconds()
+                force = age > cfg.reassert_minutes * 60
+            except ValueError:
+                force = True
+    if force:
+        # Re-assert: write whatever the screens do not currently show.
+        changed = {n: v for n, v in targets.items() if outputs.get(n) != v}
+    else:
+        changed = {n: v for n, v in targets.items() if previous.get(n) != v}
+    if state.get("outputs") and sorted(outputs) != state.get("outputs"):
+        changed = targets  # a display was added or removed: re-assert everything
+    if changed:
+        try:
+            apply_targets(changed)
+        except RuntimeError as exc:
+            warn(f"apply failed: {exc}")
+            return targets
+        for name, value in changed.items():
+            old = outputs.get(name)
+            arrow = f"{old}→{value}" if old is not None else f"→{value}"
+            print(f"{datetime.now():%H:%M} {name} {arrow}", flush=True)
+    state["targets"] = targets
+    state["outputs"] = sorted(outputs)
+    state["applied_at"] = datetime.now().isoformat(timespec="seconds")
+    save_state(state)
+    return targets
+
+
+def daemon() -> int:
+    force_flag = {"value": True}
+
+    def _force(_signum, _frame):
+        force_flag["value"] = True
+
+    signal.signal(signal.SIGUSR1, _force)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    print(f"evenfall {VERSION} started, config {CONFIG_PATH}", flush=True)
+    last_tick: float | None = None
+    while True:
+        cfg = load_config()
+        paused = pause_until()
+        if paused:
+            # Keep last_tick stale on purpose: resuming forces a re-assert.
+            force_flag["value"] = False
+        else:
+            force = force_flag["value"]
+            last_tick = last_tick or 0.0
+            # A long gap means the machine was suspended: KDE may have
+            # restored its own values, so re-assert the curve.
+            if time.time() - last_tick > max(3 * cfg.tick, 180):
+                force = True
+            force_flag["value"] = False
+            try:
+                tick(cfg, force=force)
+            except Exception as exc:  # keep the daemon alive
+                warn(f"tick failed: {exc}")
+            last_tick = time.time()
+        time.sleep(cfg.tick)
+
+
+# --------------------------------------------------------------------------- commands
+
+def cmd_status(_args) -> int:
+    cfg = load_config()
+    try:
+        outputs = read_outputs()
+    except RuntimeError as exc:
+        sys.exit(f"cannot query displays: {exc}")
+    now = datetime.now()
+    targets = current_targets(cfg, outputs, now)
+    paused = pause_until()
+    if not outputs:
+        print("no outputs reported by kscreen-doctor")
+        return 1
+    print(f"{'monitor':<10} {'now':>4} {'target':>7}  next")
+    for name, actual in outputs.items():
+        monitor = cfg.monitors.get(name)
+        target = targets.get(name)
+        shown = "n/a" if actual is None else f"{actual}%"
+        sched = "—" if target is None else f"{target}%"
+        nxt = "—"
+        if monitor and monitor.keyframes:
+            upcoming = monitor.next_change(now.hour * 60 + now.minute)
+            if upcoming:
+                nxt = f"{upcoming[0]} → {upcoming[1]}%"
+        print(f"{name:<10} {shown:>4} {sched:>7}  {nxt}")
+    if paused:
+        print(f"\npaused until {paused:%Y-%m-%d %H:%M}")
+    if not cfg.monitors:
+        print(f"\nno [monitors.*] sections in {CONFIG_PATH}")
+    return 0
+
+
+def cmd_apply(args) -> int:
+    cfg = load_config()
+    targets = tick(cfg, force=not args.if_changed, dry=args.dry_run)
+    if args.dry_run:
+        for name, value in targets.items():
+            print(f"{name} → {value}%")
+    return 0
+
+
+def cmd_preview(_args) -> int:
+    cfg = load_config()
+    if not cfg.monitors and not cfg.defaults:
+        sys.exit(f"nothing configured in {CONFIG_PATH}")
+    blocks = "▁▂▃▄▅▆▇█"
+    monitors = list(cfg.monitors.values())
+    if cfg.defaults:
+        monitors.append(Monitor(name="(defaults)", keyframes=cfg.defaults))
+    width = 48
+    axis = [" "] * width
+    for hour in range(0, 24, 6):
+        label = f"{hour:02d}"
+        col = hour * 2
+        for offset, char in enumerate(label):
+            if col + offset < width:
+                axis[col + offset] = char
+    print(f"{'':<10} {''.join(axis)}  (h)")
+    for monitor in monitors:
+        cells = []
+        for col in range(48):  # every 30 minutes
+            value = monitor.at(col * 30) or 0
+            cells.append(blocks[min(7, value * 8 // 100)])
+        points = " ".join(f"{_hm(m)}={v}%" for m, v in monitor.keyframes)
+        print(f"{monitor.name:<10} {''.join(cells)}  {points}")
+    return 0
+
+
+def _parse_duration(text: str) -> timedelta:
+    match = re.fullmatch(r"\s*(\d+)\s*([mh]?)\s*", text)
+    if not match:
+        raise ValueError(f"cannot parse duration {text!r} (use 30m, 2h, 90)")
+    amount = int(match.group(1))
+    unit = match.group(2) or "m"
+    return timedelta(hours=amount) if unit == "h" else timedelta(minutes=amount)
+
+
+def cmd_pause(args) -> int:
+    try:
+        delta = _parse_duration(args.duration)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    until = datetime.now() + delta
+    state = load_state()
+    state["pause_until"] = until.isoformat(timespec="seconds")
+    save_state(state)
+    print(f"paused until {until:%H:%M}")
+    return 0
+
+
+def cmd_resume(_args) -> int:
+    state = load_state()
+    if state.pop("pause_until", None) is None:
+        print("not paused")
+        return 0
+    save_state(state)
+    print("resumed; next tick re-applies the curve")
+    return 0
+
+
+def cmd_daemon(_args) -> int:
+    try:
+        return daemon()
+    except KeyboardInterrupt:
+        return 0
+
+
+UNIT_TEMPLATE = """\
+[Unit]
+Description=evenfall display brightness schedule
+Documentation=file://{readme}
+PartOf=graphical-session.target
+After=plasma-kwin_wayland.service graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart={binary} daemon
+Restart=always
+RestartSec=5
+Environment=EVENFALL_CONFIG={config}
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+DEFAULT_CONFIG = """\
+# evenfall — display brightness by time of day.
+# Values are 0-100 (%), interpolated linearly between keyframes.
+# Keyframes on both sides of midnight close the loop automatically.
+# Edits apply live: the daemon reloads this file on every tick.
+
+tick = 60              # seconds between recalculations (min 10)
+reassert_minutes = 0   # >0: force the value every N minutes
+
+# Shared curve for monitors without their own section.
+[defaults]
+"07:00" = 55
+"17:00" = 45
+"21:00" = 20
+"23:30" = 8
+
+{monitors}
+"""
+
+
+def cmd_install(args) -> int:
+    source = Path(__file__).resolve()
+    BIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if source != BIN_PATH:
+        shutil.copy2(source, BIN_PATH)
+        BIN_PATH.chmod(0o755)
+        print(f"installed {BIN_PATH}")
+    else:
+        print(f"already at {BIN_PATH}")
+
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        blocks = []
+        try:
+            detected = read_outputs()
+        except (RuntimeError, SystemExit):
+            detected = {}
+        for name, actual in detected.items():
+            base = actual if actual and actual > 0 else 50
+            blocks.append(
+                f"[monitors.{name}]\n"
+                f'"07:00" = {_clamp(base * 1.1)}\n'
+                f'"12:00" = {_clamp(base)}\n'
+                f'"20:00" = {_clamp(base * 0.6)}\n'
+                f'"23:30" = {_clamp(base * 0.35)}\n'
+            )
+        CONFIG_PATH.write_text(DEFAULT_CONFIG.format(monitors="\n".join(blocks)))
+        print(f"wrote {CONFIG_PATH}")
+    else:
+        print(f"config kept: {CONFIG_PATH}")
+
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    UNIT_PATH.write_text(UNIT_TEMPLATE.format(
+        binary=BIN_PATH,
+        config=CONFIG_PATH,
+        readme=Path(__file__).resolve().parent / "README.md",
+    ))
+    print(f"wrote {UNIT_PATH}")
+
+    if args.dry_run:
+        print("(dry run: systemd not touched)")
+        return 0
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "--now", f"evenfall.service"], check=False)
+    status = subprocess.run(["systemctl", "--user", "is-active", f"evenfall.service"],
+                            capture_output=True, text=True)
+    print(f"service: {status.stdout.strip() or 'unknown'}")
+    return 0
+
+
+def cmd_uninstall(args) -> int:
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"evenfall.service"], check=False)
+    UNIT_PATH.unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    print(f"removed {UNIT_PATH}")
+    if args.purge:
+        CONFIG_PATH.unlink(missing_ok=True)
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
+        BIN_PATH.unlink(missing_ok=True)
+        print("purged config, state and binary")
+    return 0
+
+
+def cmd_path(_args) -> int:
+    print(CONFIG_PATH)
+    return 0
+
+
+# --------------------------------------------------------------------------- entry
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=APP, description="Schedule display brightness in KDE Plasma.")
+    parser.add_argument("--version", action="version", version=f"evenfall {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="current vs scheduled brightness").set_defaults(func=cmd_status)
+
+    p_apply = sub.add_parser("apply", help="apply the curve once")
+    p_apply.add_argument("--if-changed", action="store_true",
+                         help="only write monitors whose value changed since the last tick")
+    p_apply.add_argument("--dry-run", action="store_true", help="print, do not touch screens")
+    p_apply.set_defaults(func=cmd_apply)
+
+    sub.add_parser("preview", help="day curve as a sparkline").set_defaults(func=cmd_preview)
+
+    p_pause = sub.add_parser("pause", help="temporarily leave screens alone")
+    p_pause.add_argument("duration", nargs="?", default="60m", help="30m, 2h, 90 (default 60m)")
+    p_pause.set_defaults(func=cmd_pause)
+
+    sub.add_parser("resume", help="end a pause").set_defaults(func=cmd_resume)
+    sub.add_parser("daemon", help="run the scheduler loop").set_defaults(func=cmd_daemon)
+    sub.add_parser("path", help="print config path").set_defaults(func=cmd_path)
+
+    p_install = sub.add_parser("install", help="install systemd user service")
+    p_install.add_argument("--dry-run", action="store_true")
+    p_install.set_defaults(func=cmd_install)
+
+    p_uninstall = sub.add_parser("uninstall", help="remove systemd user service")
+    p_uninstall.add_argument("--purge", action="store_true", help="also delete config/state/binary")
+    p_uninstall.set_defaults(func=cmd_uninstall)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

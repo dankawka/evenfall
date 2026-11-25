@@ -1,0 +1,9 @@
+[package]
+name = "evenfall-ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.14", features = ["canvas", "tokio"] }
+chrono = "0.4"
+dirs = "6"

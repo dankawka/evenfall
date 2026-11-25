@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=evenfall
+GenericName=Display brightness schedule
+Comment=Set monitor brightness by time of day
+Exec=evenfall-ui
+Icon=evenfall
+Terminal=false
+Categories=System;Settings;Monitor;
+Keywords=brightness;dim;monitor;schedule;ddc;
+StartupWMClass=evenfall-ui
